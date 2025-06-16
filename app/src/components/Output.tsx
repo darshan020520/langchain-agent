@@ -1,16 +1,50 @@
+import React from 'react';
 import MarkdownRenderer from "@/components/MarkdownRenderer";
 import { Step, type ChatOutput } from "@/types";
 import { useEffect, useState } from "react";
 
 const Output = ({ output }: { output: ChatOutput }) => {
   const detailsHidden = !!output.result?.answer;
+  const [isLoading, setIsLoading] = useState(false);
+  
+  // Debug logging
+  useEffect(() => {
+    console.log("Output component received:", output);
+    console.log("Output details:", {
+      hasResult: !!output.result,
+      hasAnswer: !!output.result?.answer,
+      hasSteps: !!output.steps?.length,
+      hasTools: !!output.result?.tools_used?.length
+    });
+    setIsLoading(!output.result?.answer);
+  }, [output]);
+
   return (
     <div className="border-t border-gray-700 py-10 first-of-type:pt-0 first-of-type:border-t-0">
       <p className="text-3xl">{output.question}</p>
 
       {/* Steps */}
-      {output.steps.length > 0 && (
-        <GenerationSteps steps={output.steps} done={detailsHidden} />
+      {output.steps && output.steps.length > 0 && (
+        <div className="mt-5">
+          <p className="text-xs text-gray-500">Generation steps:</p>
+          <div className="flex flex-col gap-1 mt-1">
+            {output.steps.map((step, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1 text-xs px-1 py-[1px] bg-gray-800 rounded text-white"
+              >
+                <p>{step.name}</p>
+                {step.result && (
+                  <p className="text-gray-400">
+                    {typeof step.result === 'string' 
+                      ? step.result 
+                      : JSON.stringify(step.result)}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
       )}
 
       {/* Output */}
@@ -20,14 +54,19 @@ const Output = ({ output }: { output: ChatOutput }) => {
           overflowWrap: "anywhere",
         }}
       >
-        <MarkdownRenderer content={output.result?.answer || ""} />
+        {output.result?.answer ? (
+          <MarkdownRenderer content={output.result.answer} />
+        ) : (
+          <p className="text-gray-500">
+            {isLoading ? "Generating response..." : "No response yet"}
+          </p>
+        )}
       </div>
 
       {/* Tools */}
-      {output.result?.tools_used?.length > 0 && (
+      {output.result?.tools_used && output.result.tools_used.length > 0 && (
         <div className="flex items-baseline mt-5 gap-1">
           <p className="text-xs text-gray-500">Tools used:</p>
-
           <div className="flex flex-wrap items-center gap-1">
             {output.result.tools_used.map((tool, i) => (
               <p
@@ -51,6 +90,13 @@ const GenerationSteps = ({ steps, done }: { steps: Step[]; done: boolean }) => {
     if (done) setHidden(true);
   }, [done]);
 
+  // Debug logging
+  useEffect(() => {
+    console.log("GenerationSteps received:", { steps, done });
+  }, [steps, done]);
+
+  if (!steps || steps.length === 0) return null;
+
   return (
     <div className="border border-gray-700 rounded mt-5 p-3 flex flex-col">
       <button
@@ -61,39 +107,19 @@ const GenerationSteps = ({ steps, done }: { steps: Step[]; done: boolean }) => {
       </button>
 
       {!hidden && (
-        <div className="flex gap-2 mt-2">
-          <div className="pt-2 flex flex-col items-center shrink-0">
-            <span
-              className={`inline-block w-3 h-3 transition-colors rounded-full ${
-                !done ? "animate-pulse bg-emerald-400" : "bg-gray-500"
-              }`}
-            ></span>
-
-            <div className="w-[1px] grow border-l border-gray-700"></div>
-          </div>
-
-          <div className="space-y-2.5">
-            {steps.map((step, j) => {
-              return (
-                <div key={j}>
-                  <p>{step.name}</p>
-
-                  <div className="flex flex-wrap items-center gap-1 mt-1">
-                    {Object.entries(step.result).map(([key, value]) => {
-                      return (
-                        <p
-                          key={key}
-                          className="text-xs px-1.5 py-0.5 bg-gray-800 rounded text-white"
-                        >
-                          {key}: {value}
-                        </p>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        <div className="space-y-2">
+          {steps.map((step, index) => (
+            <div key={index} className="p-2 bg-gray-800 rounded">
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium text-white">{step.name}</p>
+              </div>
+              <div className="mt-1">
+                <p className="text-sm text-gray-300">
+                  Result: {typeof step.result === 'object' ? JSON.stringify(step.result) : step.result}
+                </p>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -103,15 +129,15 @@ const GenerationSteps = ({ steps, done }: { steps: Step[]; done: boolean }) => {
 const ChevronDown = () => (
   <svg
     xmlns="http://www.w3.org/2000/svg"
-    width="18"
-    height="18"
+    width="24"
+    height="24"
     viewBox="0 0 24 24"
     fill="none"
     stroke="currentColor"
     strokeWidth="2"
     strokeLinecap="round"
     strokeLinejoin="round"
-    className="lucide lucide-chevron-down"
+    className="w-4 h-4"
   >
     <path d="m6 9 6 6 6-6" />
   </svg>
@@ -120,15 +146,15 @@ const ChevronDown = () => (
 const ChevronUp = () => (
   <svg
     xmlns="http://www.w3.org/2000/svg"
-    width="18"
-    height="18"
+    width="24"
+    height="24"
     viewBox="0 0 24 24"
     fill="none"
     stroke="currentColor"
     strokeWidth="2"
     strokeLinecap="round"
     strokeLinejoin="round"
-    className="lucide lucide-chevron-up"
+    className="w-4 h-4"
   >
     <path d="m18 15-6-6-6 6" />
   </svg>

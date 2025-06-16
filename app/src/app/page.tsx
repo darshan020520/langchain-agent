@@ -3,11 +3,21 @@
 import Output from "@/components/Output";
 import TextArea from "@/components/TextArea";
 import { type ChatOutput } from "@/types";
-import { useState } from "react";
+import { useState, useCallback } from "react";
 
 export default function Home() {
   const [outputs, setOutputs] = useState<ChatOutput[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+
+  const updateOutput = useCallback((index: number, update: Partial<ChatOutput>) => {
+    setOutputs(prev => {
+      const newOutputs = [...prev];
+      if (index >= 0 && index < newOutputs.length) {
+        newOutputs[index] = { ...newOutputs[index], ...update };
+      }
+      return newOutputs;
+    });
+  }, []);
 
   return (
     <div
@@ -27,6 +37,7 @@ export default function Home() {
           isGenerating={isGenerating}
           outputs={outputs}
           setOutputs={setOutputs}
+          updateOutput={updateOutput}
         />
 
         {outputs.map((output, i) => {

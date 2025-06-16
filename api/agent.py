@@ -1,7 +1,7 @@
 import os, asyncio, aiohttp, json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, SecretStr
-from langchain.callbacks.base import AsyncCallbackHandler
+from langchain.callbacks.base import AsyncCallbackHandler, BaseCallbackHandler
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -9,14 +9,68 @@ from langchain_core.runnables import ConfigurableField
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+from pathlib import Path
+from langchain.schema import LLMResult
+
+# Get the project root directory (where .env should be)
+ROOT_DIR = Path(__file__).parent.parent
+ENV_PATH = ROOT_DIR / '.env'
+
+# Debug: Print paths and check if .env exists
+print("\n=== Environment Debug Info ===")
+print(f"Project root directory: {ROOT_DIR}")
+print(f"Looking for .env at: {ENV_PATH}")
+print(f".env file exists: {ENV_PATH.exists()}")
+
+if ENV_PATH.exists():
+    print("\n=== .env File Contents ===")
+    try:
+        with open(ENV_PATH, 'r') as f:
+            # Print first few characters of each line to avoid exposing full API keys
+            for line in f:
+                if '=' in line:
+                    key, value = line.strip().split('=', 1)
+                    masked_value = value[:4] + '...' if value else 'None'
+                    print(f"{key}={masked_value}")
+    except Exception as e:
+        print(f"Error reading .env file: {e}")
+
+# Load environment variables from .env file
+print("\n=== Loading Environment Variables ===")
+load_dotenv(dotenv_path=ENV_PATH)
+
+# Print all environment variables (masked)
+print("\n=== Environment Variables ===")
+for key in ['OPENAI_API_KEY', 'SERPAPI_API_KEY']:
+    value = os.environ.get(key)
+    if value:
+        masked_value = value[:4] + '...' if value else 'None'
+        print(f"{key}={masked_value}")
+    else:
+        print(f"{key} not found in environment")
 
 # --- API KEYS ---
-OPENAI_API_KEY = SecretStr(os.environ["OPENAI_API_KEY"])
-SERPAPI_API_KEY = SecretStr(os.environ["SERPAPI_API_KEY"])
+try:
+    OPENAI_API_KEY = SecretStr(os.environ["OPENAI_API_KEY"])
+    print("\nOpenAI API key loaded successfully")
+except KeyError as e:
+    print(f"\nERROR: {str(e)}")
+    print("Please ensure you have a .env file in the project root with OPENAI_API_KEY")
+    raise
+
+try:
+    SERPAPI_API_KEY = SecretStr(os.environ["SERPAPI_API_KEY"])
+    print("SerpAPI key loaded successfully")
+except KeyError as e:
+    print(f"\nERROR: {str(e)}")
+    print("Please ensure you have a .env file in the project root with SERPAPI_API_KEY")
+    raise
 
 # --- LLM ---
+print("\n=== Initializing LLM ===")
 llm = ChatOpenAI(
-    model="gpt-4o-mini",
+    model="gpt-4-turbo-preview",
     temperature=0,
     streaming=True,
     api_key=OPENAI_API_KEY
@@ -25,8 +79,11 @@ llm = ChatOpenAI(
 # --- Prompt ---
 prompt = ChatPromptTemplate.from_messages([
     ("system", (
-        "You are a helpful assistant. Use tools to answer the current query. "
-        "Always include valid tool arguments. Use `final_answer` only to finish."
+        "You are a helpful assistant that uses tools to answer questions. "
+        "For any question that requires real-time or factual information, use the serpapi tool to search for information. "
+        "For mathematical questions, use the appropriate math tools (add, subtract, multiply, exponentiate). "
+        "Always use tools when appropriate, and only use final_answer when you have a complete answer. "
+        "When using serpapi, make sure to include relevant information from the search results in your final answer."
     )),
     MessagesPlaceholder(variable_name="messages"),
 ])
@@ -90,22 +147,43 @@ name2tool = {t.name: t.coroutine for t in tools}
 
 # --- Callback for Streaming ---
 class QueueCallbackHandler(AsyncCallbackHandler):
+    """Callback handler that puts messages into a queue."""
+    
     def __init__(self, queue: asyncio.Queue):
         self.queue = queue
-
+        self.content_buffer = ""
+    
     async def __aiter__(self):
         while True:
             item = await self.queue.get()
             if item == "<<DONE>>":
                 break
             yield item
-
+    
     async def on_llm_new_token(self, token: str, **kwargs):
         if token.strip():
-            await self.queue.put(token)
-
+            # Accumulate content
+            self.content_buffer += token
+            # Format the token as XML with proper JSON escaping
+            formatted_token = f'<step><step_name>content</step_name>{{"content": "{token}"}}</step>\n'
+            await self.queue.put(formatted_token)
+    
     async def on_llm_end(self, *args, **kwargs):
-        await self.queue.put("<<DONE>>")
+        # If we have accumulated content, send it as a final answer
+        if self.content_buffer.strip():
+            final_answer = f'<step><step_name>final_answer</step_name>{{"answer": "{self.content_buffer}", "tools_used": []}}</step>\n'
+            await self.queue.put(final_answer)
+        await self.queue.put("<<DONE>>\n")
+    
+    async def on_tool_start(self, serialized: dict, input_str: str, **kwargs):
+        tool_name = serialized.get("name", "")
+        args = json.loads(input_str) if isinstance(input_str, str) else input_str
+        tool_start_msg = f'<step><step_name>tool_start</step_name>{{"tool": "{tool_name}", "args": {json.dumps(args)}}}</step>\n'
+        await self.queue.put(tool_start_msg)
+    
+    async def on_tool_end(self, output: str, **kwargs):
+        tool_result_msg = f'<step><step_name>tool_result</step_name>{{"result": "{output}"}}</step>\n'
+        await self.queue.put(tool_result_msg)
 
 # --- Memory ---
 chat_map = {}
@@ -211,10 +289,12 @@ class CustomAgentExecutor:
                             found_tool_call_ids.add(tool_msg.tool_call_id)
                         i += 1
                     
-                    # If we didn't find all expected tool responses, we might have a broken sequence
-                    # but we'll keep what we have
+                    # If we didn't find all expected tool responses, we need to clear the history
+                    # to avoid the invalid sequence error
                     if len(found_tool_call_ids) != len(expected_tool_call_ids):
                         print(f"[WARNING] Incomplete tool call sequence. Expected {len(expected_tool_call_ids)}, found {len(found_tool_call_ids)}")
+                        # Return only the human message to start fresh
+                        return [messages[-1]] if messages and isinstance(messages[-1], HumanMessage) else []
                 
                 else:
                     # Regular AI message without tool calls
@@ -228,225 +308,176 @@ class CustomAgentExecutor:
         return valid_messages
 
     async def stream_invoke(self, input: str, session_id: str):
-        queue = asyncio.Queue()
-        callback = QueueCallbackHandler(queue)
+        print(f"[DEBUG] Starting stream_invoke with input: {input}")
+        print(f"[DEBUG] Session ID: {session_id}")
+
+        # Get chat history
         history = get_chat_history(session_id)
-        
-        # Get only valid message sequences from history
-        valid_history = self._get_valid_message_history(history.messages)
-        
+        messages = history.messages
+        print(f"[DEBUG] History messages count: {len(messages)}")
+
+        # Get valid message history
+        working_messages = self._get_valid_message_history(messages)
+        print(f"[DEBUG] Valid history messages count: {len(working_messages)}")
+
         # Add user message
-        current_user_message = HumanMessage(content=input)
-        
-        # We'll work with a working copy of messages for the conversation
-        working_messages = valid_history + [current_user_message]
+        working_messages.append(HumanMessage(content=input))
+        print(f"[DEBUG] Added user message: {input}")
+        print(f"[DEBUG] Working messages count: {len(working_messages)}")
+
+        # Create a new queue for each request
+        queue = asyncio.Queue()
 
         async def run_agent():
             try:
-                for iteration in range(self.max_iterations):
-                    print(f"[DEBUG] Iteration {iteration + 1}")
+                iteration = 1
+                while iteration <= self.max_iterations:
+                    print(f"\n[DEBUG] Iteration {iteration}")
                     print(f"[DEBUG] Working messages count: {len(working_messages)}")
-                    
-                    # Print message types for debugging
+
+                    # Debug print messages
                     for i, msg in enumerate(working_messages):
-                        msg_type = type(msg).__name__
-                        has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
-                        print(f"[DEBUG] Message {i}: {msg_type} {'(with tool_calls)' if has_tool_calls else ''}")
-                    
-                    # Prepare input for the agent
-                    input_payload = {"messages": working_messages}
-                    
-                    # Collect chunks and build complete message
-                    chunks = []
-                    content_parts = []
-                    tool_call_accumulator = ToolCallAccumulator()
-                    
-                    async for chunk in self.agent.astream(input_payload, config={
-                        "callbacks": [callback]
-                    }):
-                        chunks.append(chunk)
-                        
-                        # Collect content for streaming
-                        if hasattr(chunk, "content") and chunk.content:
-                            content_parts.append(chunk.content)
-                        
-                        # Process tool call chunks
-                        if hasattr(chunk, "tool_call_chunks") and chunk.tool_call_chunks:
-                            for tcc in chunk.tool_call_chunks:
-                                print(f"[DEBUG] Tool call chunk: {tcc}")
-                                tool_call_accumulator.add_chunk(tcc)
-                    
-                    # Get reconstructed tool calls
-                    collected_tool_calls = tool_call_accumulator.get_complete_tool_calls()
-                    print(f"[DEBUG] Reconstructed {len(collected_tool_calls)} tool calls")
-                    
-                    # Get the final message
-                    final_message = chunks[-1] if chunks else None
-                    final_content = "".join(content_parts)
-                    
-                    # Check finish reason to determine if we have tool calls
-                    has_tool_calls = False
-                    if final_message and hasattr(final_message, "response_metadata"):
-                        finish_reason = final_message.response_metadata.get("finish_reason")
-                        has_tool_calls = finish_reason == "tool_calls"
-                        print(f"[DEBUG] Finish reason: {finish_reason}, Has tool calls: {has_tool_calls}")
-                    
-                    # If no tool calls, we're done
-                    if not has_tool_calls or not collected_tool_calls:
-                        if final_content:
-                            ai_message = AIMessage(content=final_content)
-                            working_messages.append(ai_message)
-                            # Add user message and AI response to history
-                            history.add_message(current_user_message)
-                            history.add_message(ai_message)
-                        elif final_message and hasattr(final_message, "content"):
-                            ai_message = AIMessage(content=final_message.content or "")
-                            working_messages.append(ai_message)
-                            # Add user message and AI response to history
-                            history.add_message(current_user_message)
-                            history.add_message(ai_message)
-                        break
+                        print(f"[DEBUG] Message {i}: {type(msg).__name__}")
 
-                    # Process tool calls
-                    tool_messages = []
-                    valid_tool_calls = []
-                    
-                    print(f"[DEBUG] About to process {len(collected_tool_calls)} tool calls")
-                    
-                    for call in collected_tool_calls:
-                        # Extract tool information
-                        tool_name = call.get("name")
-                        tool_call_id = call.get("id")
-                        args = call.get("args", {})
+                    print("[DEBUG] Sending input payload to agent")
+                    print("[DEBUG] Starting to stream agent response")
+
+                    # Create callback handler for this iteration
+                    callback_handler = QueueCallbackHandler(queue)
+
+                    # Run agent with callbacks
+                    response = await self.agent.ainvoke(
+                        {"messages": working_messages},
+                        config={"callbacks": [callback_handler]}
+                    )
+
+                    print(f"[DEBUG] Got response from agent: {type(response)}")
+                    print(f"[DEBUG] Response content: {response.content if hasattr(response, 'content') else 'No content'}")
+                    print(f"[DEBUG] Has tool_calls: {hasattr(response, 'tool_calls')}")
+                    if hasattr(response, 'tool_calls'):
+                        print(f"[DEBUG] Tool calls: {response.tool_calls}")
+
+                    # Process response
+                    if isinstance(response, AIMessage):
+                        # Add AI message first
+                        working_messages.append(response)
                         
-                        # Skip invalid tool calls
-                        if not tool_name or not tool_call_id:
-                            print(f"[DEBUG] Skipping invalid tool call: name={tool_name}, id={tool_call_id}")
-                            continue
+                        # Check for tool calls
+                        if hasattr(response, 'tool_calls') and response.tool_calls:
+                            print(f"[DEBUG] Processing {len(response.tool_calls)} tool calls")
+                            # Track tools used
+                            tools_used = []
+                            # Process tool calls
+                            for tool_call in response.tool_calls:
+                                # Handle both dictionary and object tool calls
+                                tool_name = tool_call.get('name') if isinstance(tool_call, dict) else tool_call.name
+                                args = tool_call.get('args') if isinstance(tool_call, dict) else tool_call.args
+                                tool_call_id = tool_call.get('id') if isinstance(tool_call, dict) else tool_call.id
+
+                                print(f"[DEBUG] Processing tool call: {tool_name}")
+                                print(f"[DEBUG] Tool args: {args}")
+                                print(f"[DEBUG] Tool call ID: {tool_call_id}")
+
+                                try:
+                                    # Send tool start message
+                                    tool_start_msg = f'<step><step_name>tool_start</step_name>{{"tool": "{tool_name}", "args": {json.dumps(args)}}}</step>\n'
+                                    print(f"[DEBUG] Sending tool start message: {tool_start_msg}")
+                                    await queue.put(tool_start_msg)
+                                    
+                                    # Execute tool
+                                    print(f"[DEBUG] Executing tool: {tool_name}")
+                                    result = await name2tool[tool_name](**args)
+                                    print(f"[DEBUG] Tool result: {result}")
+                                    tools_used.append(tool_name)
+                                    
+                                    # Send tool result to frontend
+                                    print(f"[DEBUG] Sending tool result to frontend: {tool_name}")
+                                    # Format the result as a proper JSON string
+                                    tool_result = {
+                                        "tool": tool_name,
+                                        "result": str(result),
+                                        "args": args
+                                    }
+                                    result_json = json.dumps(tool_result)
+                                    print(f"[DEBUG] Tool result JSON: {result_json}")
+                                    tool_result_msg = f'<step><step_name>tool_result</step_name>{result_json}</step>\n'
+                                    print(f"[DEBUG] Sending tool result message: {tool_result_msg}")
+                                    await queue.put(tool_result_msg)
+                                    
+                                    # Add tool message
+                                    tool_msg = ToolMessage(
+                                        content=str(result),
+                                        tool_call_id=tool_call_id
+                                    )
+                                    working_messages.append(tool_msg)
+                                    
+                                except Exception as e:
+                                    error_msg = f"Error executing {tool_name}: {str(e)}"
+                                    print(f"[ERROR] {error_msg}")
+                                    print(f"[ERROR] Full error: {str(e)}")
+                                    
+                                    # Add error message
+                                    tool_msg = ToolMessage(
+                                        content=error_msg,
+                                        tool_call_id=tool_call_id
+                                    )
+                                    working_messages.append(tool_msg)
+                                    error_step = f'<step><step_name>error</step_name>{{"error": "{error_msg}"}}</step>\n'
+                                    print(f"[DEBUG] Sending error message: {error_step}")
+                                    await queue.put(error_step)
                             
-                        valid_tool_calls.append(call)
-                        
-                        try:
-                            # Execute tool
-                            if tool_name in name2tool:
-                                print(f"[DEBUG] Executing {tool_name} with args: {args}")
-                                result = await name2tool[tool_name](**args)
-                                print(f"[DEBUG] Tool {tool_name} returned: {result}")
-                                
-                                # Create tool message
-                                tool_msg = ToolMessage(
-                                    content=str(result), 
-                                    tool_call_id=tool_call_id
-                                )
-                                tool_messages.append(tool_msg)
-                                
-                                await queue.put(f"\n[Tool: {tool_name}] Result: {result}")
-                                
-                                # Check for final answer
-                                if tool_name == "final_answer":
-                                    final_ans = args.get('answer', str(result))
-                                    await queue.put(f"\n✅ Final Answer: {final_ans}")
-                                    
-                                    # Add AI message with tool calls
-                                    formatted_tool_calls = []
-                                    for call in valid_tool_calls:
-                                        formatted_call = {
-                                            "name": call["name"],
-                                            "args": call["args"],
-                                            "id": call["id"],
-                                            "type": "tool_call"
-                                        }
-                                        formatted_tool_calls.append(formatted_call)
-                                    
-                                    ai_msg = AIMessage(content=final_content, tool_calls=formatted_tool_calls)
-                                    working_messages.append(ai_msg)
-                                    
-                                    # Add tool messages
-                                    for tm in tool_messages:
-                                        working_messages.append(tm)
-                                    
-                                    # Add all messages to history
-                                    history.add_message(current_user_message)
-                                    history.add_message(ai_msg)
-                                    for tm in tool_messages:
-                                        history.add_message(tm)
-                                    
-                                    await queue.put("<<DONE>>")
-                                    return callback
-                            else:
-                                error_msg = f"Unknown tool: {tool_name}"
-                                tool_msg = ToolMessage(
-                                    content=error_msg,
-                                    tool_call_id=tool_call_id
-                                )
-                                tool_messages.append(tool_msg)
-                                await queue.put(f"\n❌ {error_msg}")
-                                
-                        except Exception as e:
-                            error_msg = f"Tool {tool_name} failed: {str(e)}"
-                            print(f"[ERROR] {error_msg}")
-                            
-                            tool_msg = ToolMessage(
-                                content=error_msg,
-                                tool_call_id=tool_call_id
-                            )
-                            tool_messages.append(tool_msg)
-                            await queue.put(f"\n❌ {error_msg}")
+                            # After processing all tool calls, send final answer with tools used
+                            final_content = response.content
+                            if not final_content and tools_used:
+                                # If no content but we have tool results, use the last tool result
+                                final_content = f"The result is {result}"
+                            print(f"[DEBUG] Sending final answer with tools used: {tools_used}")
+                            final_answer_msg = f'<step><step_name>final_answer</step_name>{{"answer": "{final_content}", "tools_used": {json.dumps(tools_used)}}}</step>\n'
+                            print(f"[DEBUG] Sending final answer message: {final_answer_msg}")
+                            await queue.put(final_answer_msg)
+                            # Add AI message to history
+                            history.add_message(response)
+                            print("[DEBUG] Sending DONE message")
+                            await queue.put("<<DONE>>\n")
+                            break
+                        else:
+                            # No tool calls, send content directly
+                            final_content = response.content
+                            print(f"[DEBUG] No valid tool calls, sending final answer: {final_content}")
+                            # Format as a final_answer step with empty tools list
+                            final_answer_msg = f'<step><step_name>final_answer</step_name>{{"answer": "{final_content}", "tools_used": []}}</step>\n'
+                            print(f"[DEBUG] Sending final answer message: {final_answer_msg}")
+                            await queue.put(final_answer_msg)
+                            # Add AI message to history
+                            history.add_message(response)
+                            print("[DEBUG] Sending DONE message")
+                            await queue.put("<<DONE>>\n")
+                            break
 
-                    # Add messages to working_messages for next iteration
-                    if valid_tool_calls and tool_messages:
-                        # Create AI message with tool calls
-                        formatted_tool_calls = []
-                        for call in valid_tool_calls:
-                            formatted_call = {
-                                "name": call["name"],
-                                "args": call["args"],
-                                "id": call["id"],
-                                "type": "tool_call"
-                            }
-                            formatted_tool_calls.append(formatted_call)
-                        
-                        ai_msg = AIMessage(content=final_content or "", tool_calls=formatted_tool_calls)
-                        working_messages.append(ai_msg)
-                        
-                        # Add corresponding tool messages immediately after
-                        for tool_msg in tool_messages:
-                            working_messages.append(tool_msg)
-                        
-                        print(f"[DEBUG] Added AI message + {len(tool_messages)} tool messages to working_messages")
-                        
-                        # Continue to next iteration
-                        continue
-                        
-                    else:
-                        # No valid tool calls - we're done
-                        ai_msg = AIMessage(content=final_content)
-                        working_messages.append(ai_msg)
-                        # Add user message and AI response to history
-                        history.add_message(current_user_message)
-                        history.add_message(ai_msg)
-                        break
+                    iteration += 1
 
-                # If we reach max iterations, add accumulated messages to history
-                # Add user message first, then any remaining messages
-                if current_user_message not in history.messages:
-                    history.add_message(current_user_message)
-                
-                # Add any remaining working messages that aren't in history
-                history_len = len(history.messages)
-                for msg in working_messages[len(valid_history) + 1:]:  # Skip the messages we already know about
-                    if msg not in history.messages:
-                        history.add_message(msg)
-                
-                await queue.put("\n⚠️ Max iterations reached without final answer")
-                await queue.put("<<DONE>>")
+                if iteration > self.max_iterations:
+                    print("[DEBUG] Max iterations reached")
+                    await queue.put(f'<step><step_name>final_answer</step_name>{{"answer": "Max iterations reached without final answer", "tools_used": []}}</step>\n')
+                    await queue.put("<<DONE>>\n")
 
             except Exception as e:
                 print(f"[ERROR] Agent Error: {e}")
-                await queue.put(f"\n💥 Agent Error: {e}")
-                await queue.put("<<DONE>>")
+                print(f"[ERROR] Full error: {str(e)}")
+                await queue.put(f'<step><step_name>error</step_name>{{"error": "{str(e)}"}}</step>\n')
+                await queue.put("<<DONE>>\n")
 
-        await run_agent()
-        return callback
+        # Start agent in background
+        asyncio.create_task(run_agent())
+        
+        # Return an async iterator that yields from the queue
+        async def queue_iterator():
+            while True:
+                item = await queue.get()
+                if item == "<<DONE>>":
+                    break
+                yield item
+        
+        return queue_iterator()
 
 agent_executor = CustomAgentExecutor()

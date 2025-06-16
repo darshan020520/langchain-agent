@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { IncompleteJsonParser } from "incomplete-json-parser";
 import { ChatOutput } from "@/types";
 
 const TextArea = ({
@@ -9,134 +8,200 @@ const TextArea = ({
   isGenerating,
   setOutputs,
   outputs,
+  updateOutput,
 }: {
   setIsGenerating: React.Dispatch<React.SetStateAction<boolean>>;
   isGenerating: boolean;
   setOutputs: React.Dispatch<React.SetStateAction<ChatOutput[]>>;
   outputs: ChatOutput[];
+  updateOutput: (index: number, update: Partial<ChatOutput>) => void;
 }) => {
-  // Parser instance to handle incomplete JSON streaming responses
-  const parser = new IncompleteJsonParser();
-
   const [text, setText] = useState("");
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Handles form submission
-  async function submit(e: React.FormEvent) {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    sendMessage(text);
-    setText("");
-  }
-
-  // Sends message to the api and handles streaming response processing
-  const sendMessage = async (text: string) => {
-    const newOutputs = [
-      ...outputs,
-      {
-        question: text,
-        steps: [],
-        result: {
-          answer: "",
-          tools_used: [],
-        },
-      },
-    ];
-
-    setOutputs(newOutputs);
-    setIsGenerating(true);
+    if (!text.trim()) return;
 
     try {
-      const res = await fetch(`http://localhost:8000/invoke?content=${text}`, {
-        method: "POST",
+      setIsGenerating(true);
+      setOutputs(prev => [...prev, { question: text, steps: [], result: null }]);
+      setText("");
+      console.log("[DEBUG] Starting request with input:", text);
+
+      const response = await fetch(`http://localhost:8000/invoke?content=${encodeURIComponent(text)}`, {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
+          'Content-Type': 'application/json',
         },
-        body: JSON.stringify(text),
       });
 
-      if (!res.ok) {
-        throw new Error("Error");
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = res.body;
-      if (!data) {
-        setIsGenerating(false);
-        return;
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('No reader available');
       }
 
-      const reader = data.getReader();
       const decoder = new TextDecoder();
-      let done = false;
-      let answer = { answer: "", tools_used: [] };
-      let currentSteps: { name: string; result: Record<string, string> }[] = [];
-      let buffer = "";
+      let buffer = '';
+      let accumulatedContent = '';
 
-      // Process streaming response chunks and parse steps/results
-      while (!done) {
-        const { value, done: doneReading } = await reader.read();
-        done = doneReading;
-        let chunkValue = decoder.decode(value);
-        // console.log(`chunk: ${chunkValue}`);
-        if (!chunkValue) continue;
-
-        buffer += chunkValue;
-
-        // Handle different types of steps in the response stream - regular steps and final answer
-        if (buffer.includes("</step_name>")) {
-          const stepNameMatch = buffer.match(/<step_name>([^<]*)<\/step_name>/);
-          if (stepNameMatch) {
-            const [_, stepName] = stepNameMatch;
-            try {
-              if (stepName !== "final_answer") {
-                const fullStepPattern =
-                  /<step><step_name>([^<]*)<\/step_name>([^<]*?)(?=<step>|<\/step>|$)/g;
-                const matches = [...buffer.matchAll(fullStepPattern)];
-
-                for (const match of matches) {
-                  const [fullMatch, matchStepName, jsonStr] = match;
-                  if (jsonStr) {
-                    try {
-                      const result = JSON.parse(jsonStr);
-                      currentSteps.push({ name: matchStepName, result });
-                      buffer = buffer.replace(fullMatch, "");
-                    } catch (error) {
-                    }
-                  }
-                }
-              } else {
-                // If it's the final answer step, parse the streaming JSON using incomplete-json-parser
-                const jsonMatch = buffer.match(
-                  /(?<=<step><step_name>final_answer<\/step_name>)(.*)/
-                );
-                if (jsonMatch) {
-                  const [_, jsonStr] = jsonMatch;
-                  parser.write(jsonStr);
-                  const result = parser.getObjects();
-                  answer = result;
-                  parser.reset();
-                }
-              }
-            } catch (e) {
-              console.log("Failed to parse step:", e);
-            }
-          }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log("[DEBUG] Stream complete");
+          break;
         }
 
-        // Update output with current content and steps
-        setOutputs((prevState) => {
-          const lastOutput = prevState[prevState.length - 1];
-          return [
-            ...prevState.slice(0, -1),
-            {
-              ...lastOutput,
-              steps: currentSteps,
-              result: answer,
-            },
-          ];
-        });
+        buffer += decoder.decode(value, { stream: true });
+        console.log("[DEBUG] Received chunk:", buffer);
+
+        // Process complete messages
+        const messages = buffer.split('\n');
+        buffer = messages.pop() || ''; // Keep the last incomplete message in the buffer
+
+        for (const message of messages) {
+          if (message.trim() === '') continue;
+          console.log("[DEBUG] Processing message:", message);
+
+          if (message === '<<DONE>>') {
+            console.log("[DEBUG] Received DONE signal");
+            continue;
+          }
+
+          try {
+            const match = message.match(/<step><step_name>(\w+)<\/step_name>(.*?)<\/step>/);
+            if (match) {
+              const [, stepName, content] = match;
+              console.log("[DEBUG] Matched step:", stepName, "Content:", content);
+
+              try {
+                const data = JSON.parse(content);
+                console.log("[DEBUG] Parsed data:", data);
+
+                switch (stepName) {
+                  case 'content':
+                    accumulatedContent += data.content;
+                    // Update the output with accumulated content
+                    setOutputs(prev => {
+                      const newOutputs = [...prev];
+                      const lastIndex = newOutputs.length - 1;
+                      if (lastIndex >= 0) {
+                        newOutputs[lastIndex] = {
+                          ...newOutputs[lastIndex],
+                          result: {
+                            answer: accumulatedContent,
+                            tools_used: []
+                          }
+                        };
+                      }
+                      return newOutputs;
+                    });
+                    break;
+                  case 'tool_start':
+                    setOutputs(prev => {
+                      const newOutputs = [...prev];
+                      const lastIndex = newOutputs.length - 1;
+                      if (lastIndex >= 0) {
+                        const currentSteps = newOutputs[lastIndex].steps || [];
+                        newOutputs[lastIndex] = {
+                          ...newOutputs[lastIndex],
+                          steps: [...currentSteps, {
+                            name: data.tool,
+                            result: "Running..."
+                          }]
+                        };
+                      }
+                      return newOutputs;
+                    });
+                    break;
+                  case 'tool_result':
+                    setOutputs(prev => {
+                      const newOutputs = [...prev];
+                      const lastIndex = newOutputs.length - 1;
+                      if (lastIndex >= 0) {
+                        const currentSteps = newOutputs[lastIndex].steps || [];
+                        const updatedSteps = [...currentSteps];
+                        const lastStepIndex = updatedSteps.length - 1;
+                        if (lastStepIndex >= 0 && updatedSteps[lastStepIndex].name === data.tool) {
+                          // Format the result for display
+                          let formattedResult = data.result;
+                          if (typeof data.result === 'string') {
+                            try {
+                              // Try to parse if it's a JSON string
+                              formattedResult = JSON.parse(data.result);
+                            } catch (e) {
+                              // If not JSON, use as is
+                              formattedResult = data.result;
+                            }
+                          }
+                          updatedSteps[lastStepIndex] = {
+                            ...updatedSteps[lastStepIndex],
+                            result: formattedResult
+                          };
+                        }
+                        newOutputs[lastIndex] = {
+                          ...newOutputs[lastIndex],
+                          steps: updatedSteps
+                        };
+                      }
+                      return newOutputs;
+                    });
+                    break;
+                  case 'final_answer':
+                    if (data.answer) {
+                      setOutputs(prev => {
+                        const newOutputs = [...prev];
+                        const lastIndex = newOutputs.length - 1;
+                        if (lastIndex >= 0) {
+                          newOutputs[lastIndex] = {
+                            ...newOutputs[lastIndex],
+                            result: { 
+                              answer: data.answer,
+                              tools_used: data.tools_used || []
+                            }
+                          };
+                        }
+                        return newOutputs;
+                      });
+                    }
+                    break;
+                  default:
+                    console.log("[DEBUG] Unmatched step:", stepName, data);
+                }
+              } catch (parseError) {
+                console.error("[DEBUG] Error parsing JSON:", parseError);
+                console.log("[DEBUG] Failed content:", content);
+              }
+            } else {
+              console.log("[DEBUG] No step match for message:", message);
+            }
+          } catch (error) {
+            console.error("[DEBUG] Error processing message:", error);
+            console.log("[DEBUG] Failed message:", message);
+          }
+        }
       }
     } catch (error) {
-      console.error(error);
+      console.error("[DEBUG] Error in handleSubmit:", error);
+      setOutputs(prev => {
+        const newOutputs = [...prev];
+        const lastIndex = newOutputs.length - 1;
+        if (lastIndex >= 0) {
+          newOutputs[lastIndex] = {
+            ...newOutputs[lastIndex],
+            result: { 
+              answer: "Error: " + (error instanceof Error ? error.message : "An error occurred"),
+              tools_used: [],
+              error: true
+            }
+          };
+        }
+        return newOutputs;
+      });
     } finally {
       setIsGenerating(false);
     }
@@ -145,7 +210,7 @@ const TextArea = ({
   // Submit form when Enter is pressed (without Shift)
   function submitOnEnter(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.code === "Enter" && !e.shiftKey) {
-      submit(e);
+      handleSubmit(e);
     }
   }
 
@@ -172,7 +237,7 @@ const TextArea = ({
 
   return (
     <form
-      onSubmit={submit}
+      onSubmit={handleSubmit}
       className={`flex gap-3 z-10 ${
         outputs.length > 0 ? "fixed bottom-0 left-0 right-0 container pb-5" : ""
       }`}
