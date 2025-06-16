@@ -1,7 +1,7 @@
 import os, asyncio, aiohttp, json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, AsyncIterator
 from pydantic import BaseModel, SecretStr
-from langchain.callbacks.base import AsyncCallbackHandler, BaseCallbackHandler
+from langchain.callbacks.base import AsyncCallbackHandler
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -11,7 +11,6 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from pathlib import Path
-from langchain.schema import LLMResult
 
 # Get the project root directory (where .env should be)
 ROOT_DIR = Path(__file__).parent.parent
@@ -99,29 +98,102 @@ class Article(BaseModel):
     def from_serpapi_result(cls, r: dict):
         return cls(**r)
 
+# --- Tool Result Interface ---
+class ToolResult(BaseModel):
+    """Base class for all tool results."""
+    tool_name: str
+    args: Dict[str, Any]
+    result: Any
+    call_id: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the result to a dictionary format."""
+        return {
+            "tool": self.tool_name,
+            "args": self.args,
+            "result": self.result,
+            "call_id": self.call_id
+        }
+
+class MathResult(ToolResult):
+    """Result type for mathematical operations."""
+    operation: str
+    operands: List[float]
+    result: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        base_dict = super().to_dict()
+        base_dict.update({
+            "operation": self.operation,
+            "operands": self.operands,
+            "result": self.result
+        })
+        return base_dict
+
+class SerpAPIResult(ToolResult):
+    """Result type for SerpAPI search."""
+    articles: List[Dict[str, str]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        base_dict = super().to_dict()
+        base_dict["result"] = self.articles
+        return base_dict
+
 # --- Tools ---
 @tool
-async def add(x: float, y: float) -> float:
+async def add(x: float, y: float, call_id: str = "") -> MathResult:
     """Add x and y together."""
-    return x + y
+    result = x + y
+    return MathResult(
+        tool_name="add",
+        args={"x": x, "y": y},
+        operation="addition",
+        operands=[x, y],
+        result=result,
+        call_id=call_id
+    )
 
 @tool
-async def subtract(x: float, y: float) -> float:
+async def subtract(x: float, y: float, call_id: str = "") -> MathResult:
     """Subtract y from x."""
-    return x - y
+    result = x - y
+    return MathResult(
+        tool_name="subtract",
+        args={"x": x, "y": y},
+        operation="subtraction",
+        operands=[x, y],
+        result=result,
+        call_id=call_id
+    )
 
 @tool
-async def multiply(x: float, y: float) -> float:
+async def multiply(x: float, y: float, call_id: str = "") -> MathResult:
     """Multiply x and y."""
-    return x * y
+    result = x * y
+    return MathResult(
+        tool_name="multiply",
+        args={"x": x, "y": y},
+        operation="multiplication",
+        operands=[x, y],
+        result=result,
+        call_id=call_id
+    )
 
 @tool
-async def exponentiate(x: float, y: float) -> float:
+async def exponentiate(x: float, y: float, call_id: str = "") -> MathResult:
     """Raise x to the power of y."""
-    return x ** y
+    result = x ** y
+    return MathResult(
+        tool_name="exponentiate",
+        args={"x": x, "y": y},
+        operation="exponentiation",
+        operands=[x, y],
+        result=result,
+        call_id=call_id
+    )
 
 @tool
-async def serpapi(query: str) -> List[Article]:
+async def serpapi(query: str, call_id: str = "") -> SerpAPIResult:
     """Search Google using SerpAPI."""
     params = {
         "api_key": SERPAPI_API_KEY.get_secret_value(),
@@ -131,7 +203,28 @@ async def serpapi(query: str) -> List[Article]:
     async with aiohttp.ClientSession() as session:
         async with session.get("https://serpapi.com/search", params=params) as res:
             data = await res.json()
-    return [Article.from_serpapi_result(r) for r in data.get("organic_results", [])]
+    
+    articles = []
+    for r in data.get("organic_results", []):
+        try:
+            article = {
+                "title": r.get("title", ""),
+                "source": r.get("source", ""),
+                "link": r.get("link", ""),
+                "snippet": r.get("snippet", "")
+            }
+            articles.append(article)
+        except Exception as e:
+            print(f"[ERROR] Failed to process article: {e}")
+            continue
+    
+    return SerpAPIResult(
+        tool_name="serpapi",
+        args={"query": query},
+        articles=articles,
+        result=articles,
+        call_id=call_id
+    )
 
 class FinalAnswer(BaseModel):
     answer: str
@@ -145,45 +238,61 @@ async def final_answer(answer: str, tools_used: List[str]) -> FinalAnswer:
 tools = [add, subtract, multiply, exponentiate, serpapi, final_answer]
 name2tool = {t.name: t.coroutine for t in tools}
 
-# --- Callback for Streaming ---
+# --- Callback Handler ---
 class QueueCallbackHandler(AsyncCallbackHandler):
     """Callback handler that puts messages into a queue."""
     
     def __init__(self, queue: asyncio.Queue):
         self.queue = queue
         self.content_buffer = ""
-    
-    async def __aiter__(self):
-        while True:
-            item = await self.queue.get()
-            if item == "<<DONE>>":
-                break
-            yield item
-    
-    async def on_llm_new_token(self, token: str, **kwargs):
-        if token.strip():
-            # Accumulate content
-            self.content_buffer += token
-            # Format the token as XML with proper JSON escaping
-            formatted_token = f'<step><step_name>content</step_name>{{"content": "{token}"}}</step>\n'
-            await self.queue.put(formatted_token)
-    
-    async def on_llm_end(self, *args, **kwargs):
-        # If we have accumulated content, send it as a final answer
-        if self.content_buffer.strip():
-            final_answer = f'<step><step_name>final_answer</step_name>{{"answer": "{self.content_buffer}", "tools_used": []}}</step>\n'
-            await self.queue.put(final_answer)
-        await self.queue.put("<<DONE>>\n")
+        self.tool_results = {}  # Track tool results by call ID
     
     async def on_tool_start(self, serialized: dict, input_str: str, **kwargs):
+        """Handle tool start event."""
         tool_name = serialized.get("name", "")
         args = json.loads(input_str) if isinstance(input_str, str) else input_str
+        tool_call_id = serialized.get("id", "")
+        
+        # Initialize tool result tracking
+        self.tool_results[tool_call_id] = {
+            "name": tool_name,
+            "args": args,
+            "result": None
+        }
+        
+        # Send tool start message
         tool_start_msg = f'<step><step_name>tool_start</step_name>{{"tool": "{tool_name}", "args": {json.dumps(args)}}}</step>\n'
         await self.queue.put(tool_start_msg)
     
-    async def on_tool_end(self, output: str, **kwargs):
-        tool_result_msg = f'<step><step_name>tool_result</step_name>{{"result": "{output}"}}</step>\n'
-        await self.queue.put(tool_result_msg)
+    async def on_tool_end(self, output: Any, **kwargs):
+        """Handle tool end event."""
+        tool_call_id = kwargs.get("tool_call_id", "")
+        tool_info = self.tool_results.get(tool_call_id, {})
+        
+        try:
+            # Convert output to ToolResult if it isn't already
+            if not isinstance(output, ToolResult):
+                output = ToolResult(
+                    tool_name=tool_info["name"],
+                    args=tool_info["args"],
+                    result=output,
+                    call_id=tool_call_id
+                )
+            else:
+                # Ensure the call_id is set correctly
+                output.call_id = tool_call_id
+            
+            # Get the serialized result
+            result_dict = output.to_dict()
+            
+            # Send the tool result
+            tool_result_msg = f'<step><step_name>tool_result</step_name>{json.dumps(result_dict)}</step>\n'
+            await self.queue.put(tool_result_msg)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to format tool result: {e}")
+            error_msg = f'<step><step_name>error</step_name>{{"error": "Failed to format tool result"}}</step>\n'
+            await self.queue.put(error_msg)
 
 # --- Memory ---
 chat_map = {}
@@ -289,12 +398,10 @@ class CustomAgentExecutor:
                             found_tool_call_ids.add(tool_msg.tool_call_id)
                         i += 1
                     
-                    # If we didn't find all expected tool responses, we need to clear the history
-                    # to avoid the invalid sequence error
+                    # If we didn't find all expected tool responses, we might have a broken sequence
+                    # but we'll keep what we have
                     if len(found_tool_call_ids) != len(expected_tool_call_ids):
                         print(f"[WARNING] Incomplete tool call sequence. Expected {len(expected_tool_call_ids)}, found {len(found_tool_call_ids)}")
-                        # Return only the human message to start fresh
-                        return [messages[-1]] if messages and isinstance(messages[-1], HumanMessage) else []
                 
                 else:
                     # Regular AI message without tool calls
@@ -325,16 +432,16 @@ class CustomAgentExecutor:
         print(f"[DEBUG] Added user message: {input}")
         print(f"[DEBUG] Working messages count: {len(working_messages)}")
 
-        # Create a new queue for each request
+        # Create queue for streaming
         queue = asyncio.Queue()
-
+        
         async def run_agent():
             try:
                 iteration = 1
                 while iteration <= self.max_iterations:
                     print(f"\n[DEBUG] Iteration {iteration}")
                     print(f"[DEBUG] Working messages count: {len(working_messages)}")
-
+                    
                     # Debug print messages
                     for i, msg in enumerate(working_messages):
                         print(f"[DEBUG] Message {i}: {type(msg).__name__}")
@@ -350,7 +457,7 @@ class CustomAgentExecutor:
                         {"messages": working_messages},
                         config={"callbacks": [callback_handler]}
                     )
-
+                    
                     print(f"[DEBUG] Got response from agent: {type(response)}")
                     print(f"[DEBUG] Response content: {response.content if hasattr(response, 'content') else 'No content'}")
                     print(f"[DEBUG] Has tool_calls: {hasattr(response, 'tool_calls')}")
@@ -359,8 +466,9 @@ class CustomAgentExecutor:
 
                     # Process response
                     if isinstance(response, AIMessage):
-                        # Add AI message first
+                        # Add AI message to both working messages and history
                         working_messages.append(response)
+                        history.add_message(response)
                         
                         # Check for tool calls
                         if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -404,24 +512,26 @@ class CustomAgentExecutor:
                                     print(f"[DEBUG] Sending tool result message: {tool_result_msg}")
                                     await queue.put(tool_result_msg)
                                     
-                                    # Add tool message
+                                    # Add tool message to both working messages and history
                                     tool_msg = ToolMessage(
                                         content=str(result),
                                         tool_call_id=tool_call_id
                                     )
                                     working_messages.append(tool_msg)
+                                    history.add_message(tool_msg)
                                     
                                 except Exception as e:
                                     error_msg = f"Error executing {tool_name}: {str(e)}"
                                     print(f"[ERROR] {error_msg}")
                                     print(f"[ERROR] Full error: {str(e)}")
                                     
-                                    # Add error message
+                                    # Add error message to both working messages and history
                                     tool_msg = ToolMessage(
                                         content=error_msg,
                                         tool_call_id=tool_call_id
                                     )
                                     working_messages.append(tool_msg)
+                                    history.add_message(tool_msg)
                                     error_step = f'<step><step_name>error</step_name>{{"error": "{error_msg}"}}</step>\n'
                                     print(f"[DEBUG] Sending error message: {error_step}")
                                     await queue.put(error_step)
@@ -435,8 +545,6 @@ class CustomAgentExecutor:
                             final_answer_msg = f'<step><step_name>final_answer</step_name>{{"answer": "{final_content}", "tools_used": {json.dumps(tools_used)}}}</step>\n'
                             print(f"[DEBUG] Sending final answer message: {final_answer_msg}")
                             await queue.put(final_answer_msg)
-                            # Add AI message to history
-                            history.add_message(response)
                             print("[DEBUG] Sending DONE message")
                             await queue.put("<<DONE>>\n")
                             break
@@ -448,12 +556,10 @@ class CustomAgentExecutor:
                             final_answer_msg = f'<step><step_name>final_answer</step_name>{{"answer": "{final_content}", "tools_used": []}}</step>\n'
                             print(f"[DEBUG] Sending final answer message: {final_answer_msg}")
                             await queue.put(final_answer_msg)
-                            # Add AI message to history
-                            history.add_message(response)
                             print("[DEBUG] Sending DONE message")
                             await queue.put("<<DONE>>\n")
                             break
-
+                    
                     iteration += 1
 
                 if iteration > self.max_iterations:
@@ -469,7 +575,7 @@ class CustomAgentExecutor:
 
         # Start agent in background
         asyncio.create_task(run_agent())
-        
+
         # Return an async iterator that yields from the queue
         async def queue_iterator():
             while True:

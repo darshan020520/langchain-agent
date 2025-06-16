@@ -111,6 +111,7 @@ const TextArea = ({
                           ...newOutputs[lastIndex],
                           steps: [...currentSteps, {
                             name: data.tool,
+                            args: data.args,
                             result: "Running..."
                           }]
                         };
@@ -140,7 +141,8 @@ const TextArea = ({
                           }
                           updatedSteps[lastStepIndex] = {
                             ...updatedSteps[lastStepIndex],
-                            result: formattedResult
+                            result: formattedResult,
+                            args: data.args
                           };
                         }
                         newOutputs[lastIndex] = {
@@ -150,6 +152,10 @@ const TextArea = ({
                       }
                       return newOutputs;
                     });
+                    break;
+                  case 'memory':
+                    // Handle memory messages
+                    console.log("[DEBUG] Memory update:", data);
                     break;
                   case 'final_answer':
                     if (data.answer) {
